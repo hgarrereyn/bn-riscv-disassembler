@@ -30,10 +30,30 @@ class RISCV(Architecture):
         r = decode(data, addr)
 
         if r is None:
-            return [tT('unk')], 4
+            return [tT('unk')], 2
 
         return r[0], r[1].length
 
     def get_instruction_low_level_il(self, data, addr, il):
-        return None
+
+        r = decode(data, addr)
+
+        if r is None:
+            return 2
+
+        if len(r) >= 3:
+            fn = r[2]
+
+            if fn is not None:
+                if type(fn) is list:
+                    for f in fn:
+                        h = f(il)
+                        if h is not None:
+                            il.append(h)
+                else:
+                    il.append(fn(il))
+
+            return r[1].length
+
+        return 2
 

@@ -1,7 +1,8 @@
 
 from binaryninja.function import RegisterInfo, InstructionInfo, InstructionTextToken
-from binaryninja.enums import InstructionTextTokenType, BranchType
-
+from binaryninja.enums import InstructionTextTokenType, BranchType, LowLevelILOperation
+from binaryninja.architecture import Architecture
+from binaryninja.lowlevelil import LowLevelILLabel
 
 # binary ninja text helpers
 def tI(x): return InstructionTextToken(InstructionTextTokenType.InstructionToken, x)
@@ -51,7 +52,7 @@ def ext(x,n):
     '''sign extend x as an "n" bit number'''
     if (x >> (n-1)) & 1:
         # invert
-        return -((~x)+1)
+        return -((2**n) - x)
     else:
         return x
 
@@ -73,15 +74,15 @@ class Instr(object):
         # immediate values
         self.imm_i = bits(x,31,20)
         self.imm_s = (bits(x,31,25) << 5) + (bits(x,11,7))
-        self.imm_b = (bits(x,12,12) << 12) + (bits(x,7,7) << 11) + (bits(x,30,25) << 5) + (bits(x,11,8))
+        self.imm_b = (bits(x,31,31) << 12) + (bits(x,7,7) << 11) + (bits(x,30,25) << 5) + (bits(x,11,8) << 1)
         self.imm_u = (bits(x,31,12) << 12)
         self.imm_j = (bits(x,31,31) << 20) + (bits(x,19,12) << 12) + (bits(x,20,20) << 11) + (bits(x,30,21) << 1)
 
         # sign extended immediates
         self.imm_i_ext = ext(self.imm_i, 12)
         self.imm_s_ext = ext(self.imm_s, 12)
-        self.imm_b_ext = ext(self.imm_b, 12)
-        self.imm_j_ext = ext(self.imm_j, 20)
+        self.imm_b_ext = ext(self.imm_b, 13)
+        self.imm_j_ext = ext(self.imm_j, 21)
 
 class CInstr(object):
     def __init__(self, x):
@@ -114,6 +115,60 @@ class CInstr(object):
         self.offset = (bits(x,12,10) << 5) + (bits(x,6,2))
         self.jump_target = bits(x,12,2)
 
+# LLIL branching util
+
+def il_jump(il, dest, is_call=False):
+
+    if is_call:
+        il.append(il.call(dest))
+    else:
+        # lookup label 
+        t = None
+        if il[dest].operation == LowLevelILOperation.LLIL_CONST:
+            t = il.get_label_for_address(Architecture['riscv:hacksec'], il[dest].constant)
+
+        # if the label doesn't exist, create a new one
+        indirect = False
+        if t is None:
+            t = LowLevelILLabel()
+            indirect = True
+
+        # if it doesn't exist, create and jump
+        if indirect:
+            il.mark_label(t)
+            il.append(il.jump(dest))
+        else:
+            # just goto label
+            il.append(il.goto(t))
+
+
+def il_branch(il, cond, tdest, fdest):
+    
+    # lookup the true branch
+    t_target = None
+    if il[tdest].operation == LowLevelILOperation.LLIL_CONST:
+        t_target = il.get_label_for_address(Architecture['riscv:hacksec'], il[tdest].constant)
+
+    # if the label doesn't exist, create a new one
+    indirect = False
+    if t_target is None:
+        t_target = LowLevelILLabel()
+        indirect = True
+
+    # create the false branch
+    f_target = LowLevelILLabel()
+
+    # create the if_expr
+    il.append(il.if_expr(cond, t_target, f_target))
+
+    # handle true target if indirect
+    if indirect:
+        il.mark_label(t_target)
+        il.append(il.jump(tdest))
+
+    # mark false branch
+    il.mark_label(f_target)
+
 
 def load_instr(op, v): 
     info = InstructionInfo()
@@ -121,7 +176,25 @@ def load_instr(op, v):
 
     tok = [tI(op), tT(' '), tR(REGS[v.rd]), tS(', '), tM('['), tR(REGS[v.rs1]), tT('+'), tA(hex(v.imm_i_ext), v.imm_i_ext), tE(']')]
 
-    return (tok, info)
+    mem = lambda il: il.add(8, il.reg(8, REGS[v.rs1]), il.const_pointer(8, v.imm_i_ext))
+
+    fn = None
+    if op == 'lb':
+        fn = lambda il: il.set_reg(8, REGS[v.rd], il.sign_extend(8, il.load(1, mem(il))))
+    elif op == 'lbu':
+        fn = lambda il: il.set_reg(8, REGS[v.rd], il.zero_extend(8, il.load(1, mem(il))))
+    elif op == 'lh':
+        fn = lambda il: il.set_reg(8, REGS[v.rd], il.sign_extend(8, il.load(2, mem(il))))
+    elif op == 'lhu':
+        fn = lambda il: il.set_reg(8, REGS[v.rd], il.zero_extend(8, il.load(2, mem(il))))
+    elif op == 'lw':
+        fn = lambda il: il.set_reg(8, REGS[v.rd], il.sign_extend(8, il.load(4, mem(il))))
+    elif op == 'lwu':
+        fn = lambda il: il.set_reg(8, REGS[v.rd], il.zero_extend(8, il.load(4, mem(il))))
+    elif op == 'ld':
+        fn = lambda il: il.set_reg(8, REGS[v.rd], il.load(8, mem(il)))
+
+    return (tok, info, fn)
 
 def store_instr(op, v): 
     info = InstructionInfo()
@@ -129,15 +202,47 @@ def store_instr(op, v):
 
     tok = [tI(op), tT(' '), tR(REGS[v.rs2]), tS(', '), tM('['), tR(REGS[v.rs1]), tT('+'), tA(hex(v.imm_s_ext), v.imm_s_ext), tE(']')]
 
-    return (tok, info)
+    mem = lambda il: il.add(8, il.reg(8, REGS[v.rs1]), il.const_pointer(8, v.imm_s_ext))
+
+    fn = None
+    if op == 'sb':
+        fn = lambda il: il.store(1, mem(il), il.low_part(1, il.reg(8, REGS[v.rs2])))
+    elif op == 'sh':
+        fn = lambda il: il.store(2, mem(il), il.low_part(2, il.reg(8, REGS[v.rs2])))
+    elif op == 'sw':
+        fn = lambda il: il.store(4, mem(il), il.low_part(4, il.reg(8, REGS[v.rs2])))
+    elif op == 'sd':
+        fn = lambda il: il.store(8, mem(il), il.reg(8, REGS[v.rs2]))
+
+    return (tok, info, fn)
 
 def itype_instr(op, v):
     info = InstructionInfo()
     info.length = 4
 
-    tok = [tI(op), tT(' '), tR(REGS[v.rd]), tS(', '), tR(REGS[v.rs1]), tS(', '), tN(hex(v.imm_i_ext), v.imm_i_ext)]
+    tok = []
+    if op == 'addi' and v.rs1 == 0: 
+        tok = [tI('li'), tT(' '), tR(REGS[v.rd]), tS(', '), tN(hex(v.imm_i_ext), v.imm_i_ext)]
+    elif op == 'addiw' and v.rs1 == 0: 
+        tok = [tI('liw'), tT(' '), tR(REGS[v.rd]), tS(', '), tN(hex(v.imm_i_ext), v.imm_i_ext)]
+    else: 
+        tok = [tI(op), tT(' '), tR(REGS[v.rd]), tS(', '), tR(REGS[v.rs1]), tS(', '), tN(hex(v.imm_i_ext), v.imm_i_ext)]
 
-    return (tok, info)
+    src = (lambda il: il.reg(8, REGS[v.rs1]))
+    if v.rs1 == 0:
+        src = (lambda il: il.const(8, 0))
+
+    fn = None
+    if op == 'addi': fn = (lambda il: il.set_reg(8, REGS[v.rd], il.add(8, src(il), il.const(8, v.imm_i_ext))))
+    elif op == 'subi': fn = (lambda il: il.set_reg(8, REGS[v.rd], il.sub(8, src(il), il.const(8, v.imm_i_ext))))
+    elif op == 'xori': fn = (lambda il: il.set_reg(8, REGS[v.rd], il.xor_expr(8, src(il), il.const(8, v.imm_i_ext))))
+    elif op == 'ori': fn = (lambda il: il.set_reg(8, REGS[v.rd], il.or_expr(8, src(il), il.const(8, v.imm_i_ext))))
+    elif op == 'andi': fn = (lambda il: il.set_reg(8, REGS[v.rd], il.and_expr(8, src(il), il.const(8, v.imm_i_ext))))
+
+    elif op == 'addiw': fn = (lambda il: il.set_reg(8, REGS[v.rd], il.add(8, src(il), il.const(8, v.imm_i_ext))))
+    elif op == 'subiw': fn = (lambda il: il.set_reg(8, REGS[v.rd], il.sub(8, src(il), il.const(8, v.imm_i_ext))))
+
+    return (tok, info, fn)
 
 def itype_shift_instr(op, v):
     info = InstructionInfo()
@@ -145,7 +250,11 @@ def itype_shift_instr(op, v):
 
     tok = [tI(op), tT(' '), tR(REGS[v.rd]), tS(', '), tR(REGS[v.rs1]), tS(', '), tN(hex(v.rs2), v.rs2)]
 
-    return (tok, info)
+    fn = None
+    if op == 'slli':
+        fn = (lambda il: il.set_reg(8, REGS[v.rd], il.shift_left(8, il.reg(8, REGS[v.rs1]), il.const(8, v.imm_i_ext))))
+
+    return (tok, info, fn)
 
 def rtype_instr(op, v):
     info = InstructionInfo()
@@ -153,7 +262,15 @@ def rtype_instr(op, v):
     
     tok = [tI(op), tT(' '), tR(REGS[v.rd]), tS(', '), tR(REGS[v.rs1]), tS(', '), tR(REGS[v.rs2])]
 
-    return (tok, info)
+    fn = None
+    if op == 'add': fn = (lambda il: il.set_reg(8, REGS[v.rd], il.add(8, il.reg(8, REGS[v.rs1]), il.reg(8, REGS[v.rs2]))))
+    elif op == 'sub': fn = (lambda il: il.set_reg(8, REGS[v.rd], il.sub(8, il.reg(8, REGS[v.rs1]), il.reg(8, REGS[v.rs2]))))
+    elif op == 'sll': fn = (lambda il: il.set_reg(8, REGS[v.rd], il.shift_left(8, il.reg(8, REGS[v.rs1]), il.reg(8, REGS[v.rs2]))))
+    elif op == 'xor': fn = (lambda il: il.set_reg(8, REGS[v.rd], il.xor_expr(8, il.reg(8, REGS[v.rs1]), il.reg(8, REGS[v.rs2]))))
+    elif op == 'and': fn = (lambda il: il.set_reg(8, REGS[v.rd], il.and_expr(8, il.reg(8, REGS[v.rs1]), il.reg(8, REGS[v.rs2]))))
+    elif op == 'or': fn = (lambda il: il.set_reg(8, REGS[v.rd], il.or_expr(8, il.reg(8, REGS[v.rs1]), il.reg(8, REGS[v.rs2]))))
+
+    return (tok, info, fn)
 
 def jal(v, addr):
     info = InstructionInfo()
@@ -169,25 +286,45 @@ def jal(v, addr):
     else:
         tok = [tI('jal'), tT(' '), tR(REGS[v.rd]), tS(', '), tA(hex(v.imm_j_ext + addr), (v.imm_j_ext + addr))]
         info.add_branch(BranchType.CallDestination, v.imm_j_ext + addr) 
+
+    fn = [
+        lambda il: il.set_reg(8, REGS[v.rd], il.add(8, il.reg(8, 'pc'), il.const(8, 4))), # link
+        lambda il: il_jump(il, il.const(8, v.imm_j_ext + addr), is_call=(v.rd==1))
+    ]
     
-    return (tok, info)
+    return (tok, info, fn)
 
 def jalr(v, addr):
     info = InstructionInfo()
     info.length = 4 
 
     tok = []
-    if v.rd == 0:
-        tok = [tI('jr'), tT(' '), tR(REGS[v.rs1]), tT('+'), tA(hex(v.imm_i_ext + addr), (v.imm_i_ext + addr))]
-        info.add_branch(BranchType.FunctionReturn, v.imm_i_ext + addr) 
-    elif v.rd == 1:
-        tok = [tI('call'), tT(' '), tR(REGS[v.rs1]), tT('+'), tA(hex(v.imm_i_ext + addr), (v.imm_i_ext + addr))]
-        info.add_branch(BranchType.CallDestination, v.imm_i_ext + addr)
+    if v.rd == 1 and v.imm_i_ext == 0:
+        tok = [tI('ret')]
+        info.add_branch(BranchType.FunctionReturn)
+    elif v.rd == 0:
+        if v.imm_i_ext == 0:
+            tok = [tI('jr'), tT(' '), tR(REGS[v.rs1])]
+        else:
+            tok = [tI('jr'), tT(' '), tR(REGS[v.rs1]), tT('+'), tA(hex(v.imm_i_ext), (v.imm_i_ext))]
+        info.add_branch(BranchType.UnresolvedBranch)
     else:
-        tok = [tI('jalr'), tT(' '), tR(REGS[v.rd]), tS(', '), tR(REGS[v.rs1]), tT('+'), tA(hex(v.imm_i_ext + addr), (v.imm_i_ext + addr))]
-        info.add_branch(BranchType.CallDestination, v.imm_i_ext + addr)
+        tok = [tI('jalr'), tT(' '), tR(REGS[v.rd]), tS(', '), tR(REGS[v.rs1]), tT('+'), tA(hex(v.imm_i_ext), (v.imm_i_ext))]
+        info.add_branch(BranchType.UnresolvedBranch)
     
-    return (tok, info)
+    fn = []
+
+    rs1 = (lambda il: il.reg(8, REGS[v.rs1])) if v.rs1 != 0 else (lambda il: il.const(8, 0))
+    target = (lambda il: il.add(8, rs1(il), il.const(8, v.imm_i_ext)))
+
+    if v.rd != 0:
+        # link
+        fn.append((lambda il: il.set_reg(8, REGS[v.rd], il.add(8, rs1(il), il.const(8, v.imm_i_ext + addr)))))
+    
+    # jump
+    fn.append((lambda il: il.jump(target(il))))
+
+    return (tok, info, fn)
 
 def lui(v):
     info = InstructionInfo()
@@ -195,7 +332,9 @@ def lui(v):
 
     tok = [tI('lui'), tT(' '), tR(REGS[v.rd]), tS(', '), tA(hex(v.imm_u), v.imm_u)]
     
-    return (tok, info)
+    fn = lambda il: il.set_reg(8, REGS[v.rd], il.const(8, v.imm_u_ext))
+
+    return (tok, info, fn)
 
 def auipc(v, addr):
     info = InstructionInfo()
@@ -203,7 +342,9 @@ def auipc(v, addr):
 
     tok = [tI('auipc'), tT(' '), tR(REGS[v.rd]), tS(', '), tA(hex(v.imm_u + addr), (v.imm_u + addr))]
     
-    return (tok, info)
+    fn = lambda il: il.set_reg(8, REGS[v.rd], il.const(8, v.imm_u + addr))
+
+    return (tok, info, fn)
 
 def branch_instr(op, v, addr):
     info = InstructionInfo()
@@ -213,6 +354,19 @@ def branch_instr(op, v, addr):
 
     tok = [tI(op), tT(' '), tR(REGS[v.rs1]), tS(', '), tR(REGS[v.rs1]), tS(', '), tA(hex(v.imm_b_ext + addr), (v.imm_b_ext + addr))]
     
+    fn = []
+    r1 = lambda il: il.reg(8, REGS[v.rs1])
+    r2 = lambda il: il.reg(8, REGS[v.rs2])
+    tdest = lambda il: il.const(8, v.imm_b_ext + addr)
+    fdest = lambda il: il.const(8, addr + 4)
+
+    if op == 'beq': fn.append(lambda il: il_branch(il, il.compare_equal(8, r1(il), r2(il)), tdest(il), fdest(il)))
+    elif op == 'bne': fn.append(lambda il: il_branch(il, il.compare_not_equal(8, r1(il), r2(il)), tdest(il), fdest(il)))
+    elif op == 'blt': fn.append(lambda il: il_branch(il, il.compare_signed_less_than(8, r1(il), r2(il)), tdest(il), fdest(il)))
+    elif op == 'bltu': fn.append(lambda il: il_branch(il, il.compare_unsigned_less_than(8, r1(il), r2(il)), tdest(il), fdest(il)))
+    elif op == 'bge': fn.append(lambda il: il_branch(il, il.compare_signed_greater_than(8, r1(il), r2(il)), tdest(il), fdest(il)))
+    elif op == 'bgeu': fn.append(lambda il: il_branch(il, il.compare_unsigned_greater_than(8, r1(il), r2(il)), tdest(il), fdest(il)))
+
     return (tok, info)
 
 def simple(op):
@@ -366,7 +520,7 @@ def decode_base(v, addr):
                 if v.rs2 == 0b00010: return simple('mret')
             elif v.funct7 == 0b0001001:
                 return simple('sfence.vma')
-                
+
         elif v.funct3 == 0b001: return csr('csrrw', v)
         elif v.funct3 == 0b010: return csr('csrrs', v)
         elif v.funct3 == 0b011: return csr('csrrc', v)
@@ -396,7 +550,9 @@ def c_addi4spn(v):
     
     tok = [tI('c.addi4spn'), tT(' '), tR(RVC[v.rd_c]), tS(', '), tR('sp'), tS(', '), tN(str(imm), imm)]
     
-    return (tok, info)
+    fn = lambda il: il.set_reg(8, RVC[v.rd_c], il.add(8, il.reg(8, 'sp'), il.const(8, imm)))
+
+    return (tok, info, fn)
 
 def c_lw(v):
     info = InstructionInfo()
@@ -407,7 +563,10 @@ def c_lw(v):
     
     tok = [tI('c.lw'), tT(' '), tR(RVC[v.rd_c]), tS(', '), tM('['), tR(RVC[v.rs1_c]), tT('+'), tA(hex(imm), imm), tE(']')]
     
-    return (tok, info)
+    mem = lambda il: il.add(8, il.reg(8, RVC[v.rs1_c]), il.const_pointer(8, imm))
+    fn = lambda il: il.set_reg(8, RVC[v.rd_c], il.zero_extend(8, il.load(4, mem(il))))
+
+    return (tok, info, fn)
 
 def c_ld(v):
     info = InstructionInfo()
@@ -418,7 +577,10 @@ def c_ld(v):
     
     tok = [tI('c.ld'), tT(' '), tR(RVC[v.rd_c]), tS(', '), tM('['), tR(RVC[v.rs1_c]), tT('+'), tA(hex(imm), imm), tE(']')]
     
-    return (tok, info)
+    mem = lambda il: il.add(8, il.reg(8, RVC[v.rs1_c]), il.const_pointer(8, imm))
+    fn = lambda il: il.set_reg(8, RVC[v.rd_c], il.load(8, mem(il)))
+
+    return (tok, info, fn)
 
 def c_sw(v):
     info = InstructionInfo()
@@ -429,7 +591,10 @@ def c_sw(v):
     
     tok = [tI('c.sw'), tT(' '), tR(RVC[v.rs2_c]), tS(', '), tM('['), tR(RVC[v.rs1_c]), tT('+'), tA(hex(imm), imm), tE(']')]
     
-    return (tok, info)
+    mem = lambda il: il.add(8, il.reg(8, RVC[v.rs1_c]), il.const_pointer(8, imm))
+    fn = lambda il: il.store(8, mem(il), il.low_part(4, il.reg(8, RVC[v.rs2_c])))
+
+    return (tok, info, fn)
 
 def c_sd(v):
     info = InstructionInfo()
@@ -440,7 +605,10 @@ def c_sd(v):
     
     tok = [tI('c.sd'), tT(' '), tR(RVC[v.rs2_c]), tS(', '), tM('['), tR(RVC[v.rs1_c]), tT('+'), tA(hex(imm), imm), tE(']')]
     
-    return (tok, info)
+    mem = lambda il: il.add(8, il.reg(8, RVC[v.rs1_c]), il.const_pointer(8, imm))
+    fn = lambda il: il.store(8, mem(il), il.reg(8, RVC[v.rs2_c]))
+
+    return (tok, info, fn)
 
 def c_addi(v):
     info = InstructionInfo()
@@ -451,7 +619,9 @@ def c_addi(v):
     
     tok = [tI('c.addi'), tT(' '), tR(REGS[v.rd]), tS(', '), tR(REGS[v.rd]), tS(', '), tN(hex(imm), imm)]
     
-    return (tok, info)
+    fn = lambda il: il.set_reg(8, REGS[v.rd], il.add(8, il.reg(8, REGS[v.rd]), il.const(8, imm)))
+
+    return (tok, info, fn)
 
 def c_addiw(v):
     info = InstructionInfo()
@@ -462,7 +632,9 @@ def c_addiw(v):
     
     tok = [tI('c.addiw'), tT(' '), tR(REGS[v.rd]), tS(', '), tR(REGS[v.rd]), tS(', '), tN(hex(imm), imm)]
     
-    return (tok, info)
+    fn = lambda il: il.set_reg(8, REGS[v.rd], il.add(8, il.reg(8, REGS[v.rd]), il.const(8, imm)))
+
+    return (tok, info, fn)
 
 def c_li(v):
     info = InstructionInfo()
@@ -473,7 +645,9 @@ def c_li(v):
     
     tok = [tI('c.li'), tT(' '), tR(REGS[v.rd]), tS(', '), tN(hex(imm), imm)]
     
-    return (tok, info)
+    fn = lambda il: il.set_reg(8, REGS[v.rd], il.const(8, imm))
+
+    return (tok, info, fn)
 
 def c_addi16sp(v):
     info = InstructionInfo()
@@ -484,7 +658,9 @@ def c_addi16sp(v):
     
     tok = [tI('c.addi16sp'), tT(' '), tR('sp'), tS(', '), tN(hex(imm), imm)]
     
-    return (tok, info)
+    fn = lambda il: il.set_reg(8, 'sp', il.add(8, il.reg(8, 'sp'), il.const(8, imm)))
+
+    return (tok, info, fn)
 
 def c_lui(v):
     info = InstructionInfo()
@@ -492,10 +668,13 @@ def c_lui(v):
 
     x = v.x
     imm = (bits(x,12,12) << 17) + (bits(x,6,2) << 12)
+    imm_ext = ext(imm, 17)
     
-    tok = [tI('c.lui'), tT(' '), tR(REGS[v.rd]), tS(', '), tN(hex(imm), imm)]
+    tok = [tI('c.lui'), tT(' '), tR(REGS[v.rd]), tS(', '), tN(hex(imm_ext), imm_ext)]
     
-    return (tok, info)
+    fn = lambda il: il.set_reg(8, REGS[v.rd], il.const(8, imm_ext))
+
+    return (tok, info, fn)
 
 def c_j(v):
     info = InstructionInfo()
@@ -508,8 +687,10 @@ def c_j(v):
     info.add_branch(BranchType.UnconditionalBranch, imm)
     
     tok = [tI('c.j'), tT(' '), tA(hex(imm), imm)]
+
+    fn = [lambda il: il_jump(il, il.const(8, imm), False)]
     
-    return (tok, info)
+    return (tok, info, fn)
 
 def c_jr(op, v):
     info = InstructionInfo()
@@ -523,7 +704,9 @@ def c_jr(op, v):
         tok = [tI(op), tT(' '), tR(REGS[v.rs1])]
         info.add_branch(BranchType.UnresolvedBranch)
     
-    return (tok, info)
+    fn = [lambda il: il_jump(il, il.reg(8, REGS[v.rs1]), False)]
+
+    return (tok, info, fn)
 
 def c_branch(op, v, addr):
     info = InstructionInfo()
@@ -532,14 +715,20 @@ def c_branch(op, v, addr):
     x = v.x
     imm = (bits(x,12,12) << 8) + (bits(x,6,5) << 6) + (bits(x,2,2) << 5) + (bits(x,11,10) << 3) + (bits(x,4,3) << 1)
 
-    target = addr + ext(imm, 8)
+    target = addr + ext(imm, 9)
 
     info.add_branch(BranchType.TrueBranch, target)
     info.add_branch(BranchType.FalseBranch, addr + 2)
     
     tok = [tI(op), tT(' '), tR(RVC[v.rs1_c]), tS(', '), tA(hex(target), target)]
     
-    return (tok, info)
+    fn = []
+    if op == 'c.beqz':
+        fn.append(lambda il: il_branch(il, il.compare_equal(8, il.reg(8, RVC[v.rs1_c]), il.const(8, 0)), il.const(8, target), il.const(8, addr+2)))
+    elif op == 'c.bnez':
+        fn.append(lambda il: il_branch(il, il.compare_not_equal(8, il.reg(8, RVC[v.rs1_c]), il.const(8, 0)), il.const(8, target), il.const(8, addr+2)))
+    
+    return (tok, info, fn)
 
 def c_slli(v):
     info = InstructionInfo()
@@ -580,7 +769,9 @@ def c_mv(v):
 
     tok = [tI('c.mv'), tT(' '), tR(REGS[v.rd]), tS(', '), tR(REGS[v.rs2])]
     
-    return (tok, info)
+    fn = lambda il: il.set_reg(8, REGS[v.rd], il.reg(8, REGS[v.rs2]))
+
+    return (tok, info, fn)
 
 def c_add(v):
     info = InstructionInfo()
@@ -599,7 +790,10 @@ def c_swsp(v):
     
     tok = [tI('c.swsp'), tT(' '), tR(REGS[v.rs2]), tS(', '), tM('['), tR('sp'), tT('+'), tA(hex(imm), imm), tE(']')]
     
-    return (tok, info)
+    mem = lambda il: il.add(8, il.reg(8, 'sp'), il.const(8, imm))
+    fn = lambda il: il.store(8, mem(il), il.low_part(4, il.reg(8, REGS[v.rs2])))
+
+    return (tok, info, fn)
 
 def c_sdsp(v):
     info = InstructionInfo()
@@ -610,7 +804,10 @@ def c_sdsp(v):
     
     tok = [tI('c.sdsp'), tT(' '), tR(REGS[v.rs2]), tS(', '), tM('['), tR('sp'), tT('+'), tA(hex(imm), imm), tE(']')]
     
-    return (tok, info)
+    mem = lambda il: il.add(8, il.reg(8, 'sp'), il.const(8, imm))
+    fn = lambda il: il.store(8, mem(il), il.reg(8, REGS[v.rs2]))
+
+    return (tok, info, fn)
 
 def decode_compressed(v, addr):
     '''C extension'''
