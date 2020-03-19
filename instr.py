@@ -176,7 +176,7 @@ def load_instr(op, v):
 
     tok = [tI(op), tT(' '), tR(REGS[v.rd]), tS(', '), tM('['), tR(REGS[v.rs1]), tT('+'), tA(hex(v.imm_i_ext), v.imm_i_ext), tE(']')]
 
-    mem = lambda il: il.add(8, il.reg(8, REGS[v.rs1]), il.const_pointer(8, v.imm_i_ext))
+    mem = lambda il: il.add(8, il.reg(8, REGS[v.rs1]), il.const(8, v.imm_i_ext))
 
     fn = None
     if op == 'lb':
@@ -202,7 +202,7 @@ def store_instr(op, v):
 
     tok = [tI(op), tT(' '), tR(REGS[v.rs2]), tS(', '), tM('['), tR(REGS[v.rs1]), tT('+'), tA(hex(v.imm_s_ext), v.imm_s_ext), tE(']')]
 
-    mem = lambda il: il.add(8, il.reg(8, REGS[v.rs1]), il.const_pointer(8, v.imm_s_ext))
+    mem = lambda il: il.add(8, il.reg(8, REGS[v.rs1]), il.const(8, v.imm_s_ext))
 
     fn = None
     if op == 'sb':
@@ -352,7 +352,7 @@ def branch_instr(op, v, addr):
     info.add_branch(BranchType.TrueBranch, v.imm_b_ext + addr) 
     info.add_branch(BranchType.FalseBranch, addr + 4)
 
-    tok = [tI(op), tT(' '), tR(REGS[v.rs1]), tS(', '), tR(REGS[v.rs1]), tS(', '), tA(hex(v.imm_b_ext + addr), (v.imm_b_ext + addr))]
+    tok = [tI(op), tT(' '), tR(REGS[v.rs1]), tS(', '), tR(REGS[v.rs2]), tS(', '), tA(hex(v.imm_b_ext + addr), (v.imm_b_ext + addr))]
     
     fn = []
     r1 = lambda il: il.reg(8, REGS[v.rs1])
@@ -367,7 +367,7 @@ def branch_instr(op, v, addr):
     elif op == 'bge': fn.append(lambda il: il_branch(il, il.compare_signed_greater_than(8, r1(il), r2(il)), tdest(il), fdest(il)))
     elif op == 'bgeu': fn.append(lambda il: il_branch(il, il.compare_unsigned_greater_than(8, r1(il), r2(il)), tdest(il), fdest(il)))
 
-    return (tok, info)
+    return (tok, info, fn)
 
 def simple(op):
     info = InstructionInfo()
@@ -741,7 +741,9 @@ def c_slli(v):
 
     tok = [tI('c.slli'), tT(' '), tR(REGS[v.rd]), tS(', '), tR(REGS[v.rd]), tS(', '), tN(hex(imm), imm)]
     
-    return (tok, info)
+    fn = lambda il: il.set_reg(8, REGS[v.rd], il.shift_left(8, il.reg(8, REGS[v.rd]), il.const(8, imm)))
+
+    return (tok, info, fn)
 
 def c_lwsp(v):
     info = InstructionInfo()
@@ -752,7 +754,10 @@ def c_lwsp(v):
     
     tok = [tI('c.lwsp'), tT(' '), tR(REGS[v.rd]), tS(', '), tM('['), tR('sp'), tT('+'), tA(hex(imm), imm), tE(']')]
     
-    return (tok, info)
+    mem = lambda il: il.add(8, il.reg(8, 'sp'), il.const(8, imm))
+    fn = lambda il: il.set_reg(8, REGS[v.rd], il.zero_extend(8, il.load(4, mem(il))))
+
+    return (tok, info, fn)
 
 def c_ldsp(v):
     info = InstructionInfo()
@@ -763,7 +768,10 @@ def c_ldsp(v):
     
     tok = [tI('c.ldsp'), tT(' '), tR(REGS[v.rd]), tS(', '), tM('['), tR('sp'), tT('+'), tA(hex(imm), imm), tE(']')]
     
-    return (tok, info)
+    mem = lambda il: il.add(8, il.reg(8, 'sp'), il.const(8, imm))
+    fn = lambda il: il.set_reg(8, REGS[v.rd], il.load(8, mem(il)))
+
+    return (tok, info, fn)
 
 def c_mv(v):
     info = InstructionInfo()
@@ -781,7 +789,9 @@ def c_add(v):
 
     tok = [tI('c.add'), tT(' '), tR(REGS[v.rd]), tS(', '), tR(REGS[v.rd]), tS(', '), tR(REGS[v.rs2])]
     
-    return (tok, info)
+    fn = lambda il: il.set_reg(8, REGS[v.rd], il.add(8, il.reg(8, REGS[v.rd]), il.reg(8, REGS[v.rs2])))
+
+    return (tok, info, fn)
 
 def c_swsp(v):
     info = InstructionInfo()
