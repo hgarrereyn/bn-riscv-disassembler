@@ -676,7 +676,7 @@ def c_lui(v):
 
     return (tok, info, fn)
 
-def c_j(v):
+def c_j(v, addr):
     info = InstructionInfo()
     info.length = 2
 
@@ -684,11 +684,13 @@ def c_j(v):
     imm = (bits(x,12,12) << 11) + (bits(x,8,8) << 10) + (bits(x,10,9) << 8) + (bits(x,6,6) << 7) \
         + (bits(x,7,7) << 6) + (bits(x,2,2) << 5) + (bits(x,11,11) << 4) + (bits(x,5,3) << 1)
 
-    info.add_branch(BranchType.UnconditionalBranch, imm)
-    
-    tok = [tI('c.j'), tT(' '), tA(hex(imm), imm)]
+    target = ext(imm, 12) + addr
 
-    fn = [lambda il: il_jump(il, il.const(8, imm), False)]
+    info.add_branch(BranchType.UnconditionalBranch, target)
+    
+    tok = [tI('c.j'), tT(' '), tA(hex(target), target)]
+
+    fn = [lambda il: il_jump(il, il.const(8, target), False)]
     
     return (tok, info, fn)
 
@@ -836,7 +838,7 @@ def decode_compressed(v, addr):
             elif v.rd != 0b0000: return c_lui(v)
         elif v.funct3 == 0b100:
             return c_simple('<c.math>')
-        elif v.funct3 == 0b101: return c_j(v)
+        elif v.funct3 == 0b101: return c_j(v, addr)
         elif v.funct3 == 0b110: return c_branch('c.beqz', v, addr)
         elif v.funct3 == 0b111: return c_branch('c.bnez', v, addr)
     elif v.op == 0b10:
