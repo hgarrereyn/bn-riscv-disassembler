@@ -30,6 +30,29 @@ RVC = [
     'a2', 'a3', 'a4', 'a5'
 ]
 
+CSR = {
+    0xf11: 'mvendorid',
+    0xf12: 'marchid',
+    0xf13: 'mimpid',
+    0xf14: 'mhartid',
+
+    0x300: 'mstatus',
+    0x301: 'misa',
+    0x302: 'medeleg',
+    0x303: 'mideleg',
+    0x304: 'mie',
+    0x305: 'mtvec',
+    0x306: 'mcounteren',
+
+    0x340: 'mscratch',
+    0x341: 'mepc',
+    0x342: 'mcause',
+    0x343: 'mtval',
+    0x344: 'mip',
+    0x34a: 'mtinst',
+    0x34b: 'mtval2'
+}
+
 def u32(dat):
     x = 0
     x += dat[0]
@@ -332,7 +355,7 @@ def lui(v):
 
     tok = [tI('lui'), tT(' '), tR(REGS[v.rd]), tS(', '), tA(hex(v.imm_u), v.imm_u)]
     
-    fn = lambda il: il.set_reg(8, REGS[v.rd], il.const(8, v.imm_u_ext))
+    fn = lambda il: il.set_reg(8, REGS[v.rd], il.const(8, v.imm_u))
 
     return (tok, info, fn)
 
@@ -380,16 +403,28 @@ def simple(op):
 def csr(op, v):
     info = InstructionInfo()
     info.length = 4
-    
-    tok = [tI(op), tT(' '), tR(REGS[v.rd]), tS(', '), tR(REGS[v.rs1]), tS(', '), tT('csr_%d' % v.imm_i)]
+
+    csr_nm = 'csr_%X' % v.imm_i
+    if v.imm_i in CSR:
+        csr_nm = CSR[v.imm_i]
+
+    tok = []
+    if op == 'csrrs' and v.rs1 == 0:
+        tok = [tI('csrr'), tT(' '), tR(REGS[v.rd]), tS(', '), tT(csr_nm)]
+    else:
+        tok = [tI(op), tT(' '), tR(REGS[v.rd]), tS(', '), tR(REGS[v.rs1]), tS(', '), tT(csr_nm)]
     
     return (tok, info)
 
 def csr_i(op, v):
     info = InstructionInfo()
     info.length = 4
+
+    csr_nm = 'csr_%X' % v.imm_i
+    if v.imm_i in CSR:
+        csr_nm = CSR[v.imm_i]
     
-    tok = [tI(op), tT(' '), tR(REGS[v.rd]), tS(', '), tN(str(ext(v.rs1, 5)), ext(v.rs1, 5)), tS(', '), tT('csr_%d' % v.imm_i)]
+    tok = [tI(op), tT(' '), tR(REGS[v.rd]), tS(', '), tN(str(ext(v.rs1, 5)), ext(v.rs1, 5)), tS(', '), tT(csr_nm)]
     
     return (tok, info)
 
